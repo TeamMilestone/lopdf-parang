@@ -322,12 +322,39 @@ fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
             // artificial error kind is created to allow descriptive nom errors
             return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
         }
-        let (i, data) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i)?;
-        Ok((i, Object::Stream(Stream::new(dict, data.to_vec()))))
+        // Try to read stream data using the declared Length value
+        if let Ok((i, data)) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
+            return Ok((i, Object::Stream(Stream::new(dict, data.to_vec()))));
+        }
+        // Fallback: Length may be incorrect (common in linearized PDFs).
+        // Search for "endstream" marker and use actual data between stream/endstream.
+        if let Some(result) = find_endstream_fallback(&i, dict.clone()) {
+            return Ok(result);
+        }
+        // If fallback also fails, return error
+        Err(nom::Err::Error(NomError::from_error_kind(i, ErrorKind::Tag)))
     } else {
         // Return position relative to the start of the stream dictionary.
         Ok((i, Object::Stream(Stream::with_position(dict, input.len() - i.len()))))
     }
+}
+
+/// Fallback stream data extraction: search for "endstream" marker when Length is incorrect.
+fn find_endstream_fallback<'a>(input: &ParserInput<'a>, dict: Dictionary) -> Option<(ParserInput<'a>, Object)> {
+    let bytes: &[u8] = &input;
+    // Search for \rendstream, \nendstream, or just endstream
+    let markers = [b"\r\nendstream".as_slice(), b"\rendstream".as_slice(), b"\nendstream".as_slice(), b"endstream".as_slice()];
+    for marker in &markers {
+        if let Some(pos) = bytes.windows(marker.len()).position(|w| w == *marker) {
+            let data = &bytes[..pos];
+            let after_endstream = pos + marker.len();
+            if after_endstream <= bytes.len() {
+                let remaining = input.take_from(after_endstream);
+                return Some((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+            }
+        }
+    }
+    None
 }
 
 fn unsigned_int<I: FromStr>(input: ParserInput) -> NomResult<I> {
@@ -469,32 +496,229 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
 }
 
 pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
-    let xref_trailer = map(pair(xref, trailer), |(mut xref, trailer)| {
+    // Try traditional xref table + trailer first
+    let mut xref_trailer = map(pair(xref, trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
             .and_then(Object::as_i64)
             .map_err(|_| error::ParseError::InvalidTrailer)? as u32;
         Ok((xref, trailer))
     });
-    alt((
-        xref_trailer,
-        (|input| {
-            _indirect_object(input, 0, None, reader, &mut HashSet::new())
-                .map(|(_, obj)| {
-                    let res = match obj {
-                        Object::Stream(stream) => decode_xref_stream(stream),
-                        _ => Err(crate::error::ParseError::InvalidXref.into()),
-                    };
-                    (input, res)
-                })
-                .map_err(|_| {
-                    // artificial error kind is created to allow descriptive nom errors
-                    nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Fail))
-                })
-        }),
-    )).parse(input)
-    .map(|(_, o)| o)
-    .map_err(|_| error::ParseError::InvalidTrailer)?
+    if let Some(result) = strip_nom(xref_trailer.parse(input)) {
+        return result;
+    }
+
+    // Try xref stream via indirect object parsing
+    if let Ok((_, obj)) = _indirect_object(input, 0, None, reader, &mut HashSet::new()) {
+        if let Object::Stream(stream) = obj {
+            return decode_xref_stream(stream);
+        }
+    }
+
+    // Fallback: lenient xref stream parsing for linearized/incremental PDFs.
+    // Some PDFs have xref stream objects where _indirect_object fails due to
+    // trailing data or format quirks after endobj.
+    parse_xref_stream_object_lenient(input, reader)
+}
+
+/// Lenient xref stream parser for linearized/incremental PDFs.
+/// Handles cases where standard parsing fails due to:
+/// 1. Incorrect /Length values (stream data shorter than declared)
+/// 2. Malformed literal strings in dictionary (unbalanced parentheses in binary data)
+fn parse_xref_stream_object_lenient(input: ParserInput, _reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
+    let bytes: &[u8] = &input;
+
+    // Strategy: find ">>", then "stream\r\n" or "stream\n", then "endstream"
+    // and extract the dict and stream data by byte scanning.
+
+    // Skip "N 0 obj" prefix
+    let obj_end = bytes.windows(3).position(|w| w == b"obj")
+        .ok_or(crate::error::ParseError::InvalidXref)?;
+    let after_obj = obj_end + 3;
+
+    // Find the dictionary start "<<"
+    let dict_start = bytes[after_obj..].windows(2).position(|w| w == b"<<")
+        .ok_or(crate::error::ParseError::InvalidXref)?;
+    let dict_abs_start = after_obj + dict_start;
+
+    // Find ">>" followed by a stream keyword.
+    // We search for ">>stream" or ">>\nstream" or ">>\r\nstream" or ">> stream"
+    let mut stream_keyword_pos = None;
+    let mut dict_end_pos = None;
+    for i in dict_abs_start..bytes.len().saturating_sub(10) {
+        if bytes[i] == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            // Check if "stream" follows after optional whitespace
+            let after_gg = i + 2;
+            let mut j = after_gg;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\r' || bytes[j] == b'\n') {
+                j += 1;
+            }
+            if j + 6 <= bytes.len() && &bytes[j..j + 6] == b"stream" {
+                dict_end_pos = Some(after_gg);
+                // stream data starts after "stream\r\n" or "stream\n"
+                let mut k = j + 6;
+                if k < bytes.len() && bytes[k] == b'\r' { k += 1; }
+                if k < bytes.len() && bytes[k] == b'\n' { k += 1; }
+                stream_keyword_pos = Some(k);
+                break;
+            }
+        }
+    }
+
+    let stream_data_start = stream_keyword_pos.ok_or(crate::error::ParseError::InvalidXref)?;
+    let _dict_end = dict_end_pos.ok_or(crate::error::ParseError::InvalidXref)?;
+
+    // Find "endstream"
+    let endstream_pos = bytes[stream_data_start..].windows(9).position(|w| w == b"endstream")
+        .ok_or(crate::error::ParseError::InvalidXref)?;
+    let endstream_abs = stream_data_start + endstream_pos;
+
+    // Trim trailing \r\n from stream data
+    let mut data_end = endstream_abs;
+    if data_end > stream_data_start && bytes[data_end - 1] == b'\n' { data_end -= 1; }
+    if data_end > stream_data_start && bytes[data_end - 1] == b'\r' { data_end -= 1; }
+
+    let stream_data = &bytes[stream_data_start..data_end];
+
+    // Now parse the dictionary portion properly. First try the standard parser.
+    let dict_bytes = &bytes[dict_abs_start.._dict_end];
+    let dict = if let Some(d) = strip_nom(dictionary.parse(ParserInput::new_extra(dict_bytes, ""))) {
+        d
+    } else {
+        // If dictionary parsing fails (e.g. due to malformed strings),
+        // extract key fields via regex-like byte scanning.
+        parse_xref_dict_from_bytes(bytes, dict_abs_start, _dict_end)?
+    };
+
+    let stream = Stream::new(dict, stream_data.to_vec());
+    decode_xref_stream(stream)
+}
+
+/// Extract essential xref stream dictionary fields by byte scanning.
+/// Used when the standard dictionary parser fails due to malformed values.
+fn parse_xref_dict_from_bytes(bytes: &[u8], start: usize, end: usize) -> crate::Result<Dictionary> {
+    use crate::Object;
+
+    let region = &bytes[start..end];
+    let mut dict = Dictionary::new();
+
+    // Helper: find integer value after a key
+    fn find_int(region: &[u8], key: &[u8]) -> Option<i64> {
+        region.windows(key.len()).position(|w| w == key).and_then(|pos| {
+            let after = &region[pos + key.len()..];
+            let s: String = after.iter()
+                .skip_while(|&&b| b == b' ')
+                .take_while(|&&b| b.is_ascii_digit())
+                .map(|&b| b as char)
+                .collect();
+            s.parse().ok()
+        })
+    }
+
+    // /Size (required)
+    let size = find_int(region, b"/Size").ok_or(crate::error::ParseError::InvalidXref)?;
+    dict.set(b"Size".to_vec(), Object::Integer(size));
+
+    // /Length (required for stream)
+    if let Some(length) = find_int(region, b"/Length") {
+        dict.set(b"Length".to_vec(), Object::Integer(length));
+    }
+
+    // Helper: parse "N 0 R" reference from bytes after a key
+    fn find_ref(region: &[u8], key: &[u8]) -> Option<(u32, u16)> {
+        region.windows(key.len()).position(|w| w == key).and_then(|pos| {
+            let after = &region[pos + key.len()..];
+            // Parse: whitespace number whitespace number whitespace "R"
+            let s = std::str::from_utf8(after).unwrap_or("");
+            let mut parts = s.split_whitespace();
+            let id: u32 = parts.next()?.parse().ok()?;
+            let generation: u16 = parts.next()?.parse().ok()?;
+            let r = parts.next()?;
+            // "R" may be followed by "/" or other delimiters without space
+            if r == "R" || r.starts_with("R/") || r.starts_with("R>") || r.starts_with("R)") {
+                Some((id, generation))
+            } else {
+                None
+            }
+        })
+    }
+
+    // /Root N 0 R
+    if let Some((id, generation)) = find_ref(region, b"/Root") {
+        dict.set(b"Root".to_vec(), Object::Reference((id, generation)));
+    }
+
+    // /Info N 0 R
+    if let Some((id, generation)) = find_ref(region, b"/Info") {
+        dict.set(b"Info".to_vec(), Object::Reference((id, generation)));
+    }
+
+    // /Prev N
+    if let Some(prev) = find_int(region, b"/Prev") {
+        dict.set(b"Prev".to_vec(), Object::Integer(prev));
+    }
+
+    // /W [a b c]
+    if let Some(pos) = region.windows(2).position(|w| w == b"/W") {
+        let after = &region[pos + 2..];
+        if let Some(bracket_start) = after.iter().position(|&b| b == b'[') {
+            if let Some(bracket_end) = after[bracket_start..].iter().position(|&b| b == b']') {
+                let arr_str = &after[bracket_start + 1..bracket_start + bracket_end];
+                let nums: Vec<Object> = std::str::from_utf8(arr_str).unwrap_or("")
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<i64>().ok().map(Object::Integer))
+                    .collect();
+                dict.set(b"W".to_vec(), Object::Array(nums));
+            }
+        }
+    }
+
+    // /Index [a b c d ...]
+    if let Some(pos) = region.windows(6).position(|w| w == b"/Index") {
+        let after = &region[pos + 6..];
+        if let Some(bracket_start) = after.iter().position(|&b| b == b'[') {
+            if let Some(bracket_end) = after[bracket_start..].iter().position(|&b| b == b']') {
+                let arr_str = &after[bracket_start + 1..bracket_start + bracket_end];
+                let nums: Vec<Object> = std::str::from_utf8(arr_str).unwrap_or("")
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<i64>().ok().map(Object::Integer))
+                    .collect();
+                dict.set(b"Index".to_vec(), Object::Array(nums));
+            }
+        }
+    }
+
+    // /Filter /FlateDecode
+    if let Some(pos) = region.windows(7).position(|w| w == b"/Filter") {
+        let after = &region[pos + 7..];
+        // Skip whitespace, then read /Name
+        let trimmed = after.iter().skip_while(|&&b| b == b' ').copied().collect::<Vec<u8>>();
+        if trimmed.starts_with(b"/") {
+            let name: Vec<u8> = trimmed[1..].iter()
+                .take_while(|&&b| b.is_ascii_alphanumeric())
+                .copied()
+                .collect();
+            dict.set(b"Filter".to_vec(), Object::Name(name));
+        }
+    }
+
+    // /DecodeParms << /Columns N /Predictor N >>
+    if let Some(pos) = region.windows(12).position(|w| w == b"/DecodeParms") {
+        let after = &region[pos + 12..];
+        if let Some(dict_start) = after.windows(2).position(|w| w == b"<<") {
+            if let Some(dict_end) = after[dict_start..].windows(2).position(|w| w == b">>") {
+                let inner = &after[dict_start..dict_start + dict_end + 2];
+                if let Some(d) = strip_nom(dictionary.parse(ParserInput::new_extra(inner, ""))) {
+                    dict.set(b"DecodeParms".to_vec(), Object::Dictionary(d));
+                }
+            }
+        }
+    }
+
+    // /Type /XRef
+    dict.set(b"Type".to_vec(), Object::Name(b"XRef".to_vec()));
+
+    Ok(dict)
 }
 
 pub fn xref_start(input: ParserInput) -> Option<i64> {

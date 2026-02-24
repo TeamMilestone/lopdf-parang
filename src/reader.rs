@@ -1220,7 +1220,9 @@ impl Reader<'_> {
     }
 
     fn get_xref_start(buffer: &[u8]) -> Result<usize> {
-        let seek_pos = buffer.len() - cmp::min(buffer.len(), 512);
+        // Search in the last 2048 bytes for %%EOF (was 512; some PDFs have
+        // trailing garbage or truncated xref data after %%EOF).
+        let seek_pos = buffer.len() - cmp::min(buffer.len(), 2048);
         Self::search_substring(buffer, b"%%EOF", seek_pos)
             .and_then(|eof_pos| if eof_pos > 25 { Some(eof_pos) } else { None })
             .and_then(|eof_pos| Self::search_substring(buffer, b"startxref", eof_pos - 25))
