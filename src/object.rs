@@ -689,6 +689,7 @@ impl Stream {
                 b"FlateDecode" => Self::decompress_zlib(input, params)?,
                 b"LZWDecode" => Self::decompress_lzw(input, params)?,
                 b"ASCII85Decode" => Self::decode_ascii85(input)?,
+                b"ASCIIHexDecode" => Self::decode_ascii_hex(input),
                 _ => return Err(Error::Unimplemented("decompression algorithms")),
             };
             input = &output;
@@ -741,6 +742,35 @@ impl Stream {
             });
         }
         Self::decompress_predictor(output, params)
+    }
+
+    /// Decode ASCIIHexDecode filter: hex text → binary bytes.
+    /// Whitespace is ignored. `>` marks end-of-data.
+    /// An odd trailing hex digit has an implicit 0 appended.
+    fn decode_ascii_hex(input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(input.len() / 2);
+        let mut high_nibble: Option<u8> = None;
+        for &b in input {
+            let nibble = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                b'>' => break, // EOD marker
+                _ => continue, // skip whitespace and other chars
+            };
+            match high_nibble {
+                None => high_nibble = Some(nibble),
+                Some(hi) => {
+                    output.push((hi << 4) | nibble);
+                    high_nibble = None;
+                }
+            }
+        }
+        // Odd trailing digit: append implicit 0
+        if let Some(hi) = high_nibble {
+            output.push(hi << 4);
+        }
+        output
     }
 
     fn decode_ascii85(input: &[u8]) -> Result<Vec<u8>> {

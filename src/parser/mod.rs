@@ -326,12 +326,20 @@ fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
         if let Ok((i, data)) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
             return Ok((i, Object::Stream(Stream::new(dict, data.to_vec()))));
         }
-        // Fallback: Length may be incorrect (common in linearized PDFs).
-        // Search for "endstream" marker and use actual data between stream/endstream.
-        if let Some(result) = find_endstream_fallback(&i, dict.clone()) {
-            return Ok(result);
+        // Fallback: Only for xref streams (/Type /XRef) where Length is often
+        // incorrect in linearized PDFs with incremental updates.
+        // Do NOT apply to regular content streams as the endstream marker search
+        // may match bytes inside compressed/binary stream data.
+        let is_xref_stream = dict.get(b"Type")
+            .and_then(|o| o.as_name())
+            .map(|n| n == b"XRef")
+            .unwrap_or(false);
+        if is_xref_stream {
+            if let Some(result) = find_endstream_fallback(&i, dict.clone()) {
+                return Ok(result);
+            }
         }
-        // If fallback also fails, return error
+        // If fallback doesn't apply or fails, return error
         Err(nom::Err::Error(NomError::from_error_kind(i, ErrorKind::Tag)))
     } else {
         // Return position relative to the start of the stream dictionary.
@@ -769,7 +777,7 @@ fn operation(input: ParserInput) -> NomResult<Operation> {
     map(
         preceded(
             many0(comment),
-            alt((inline_image, terminated(pair(many0(operand), operator), content_space))),
+            alt((inline_image, terminated(pair(many0(operand), preceded(content_space, operator)), content_space))),
         ),
         |(operands, operator)| Operation { operator, operands },
     ).parse(input)
