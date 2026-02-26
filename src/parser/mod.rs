@@ -324,7 +324,12 @@ fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
         }
         // Try to read stream data using the declared Length value
         if let Ok((i, data)) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
-            return Ok((i, Object::Stream(Stream::new(dict, data.to_vec()))));
+            // If reader has a skip predicate and the dict matches, skip the content copy
+            let should_skip = reader.skip_stream_content
+                .map(|pred| pred(&dict))
+                .unwrap_or(false);
+            let content = if should_skip { vec![] } else { data.to_vec() };
+            return Ok((i, Object::Stream(Stream::new(dict, content))));
         }
         // Fallback: Only for xref streams (/Type /XRef) where Length is often
         // incorrect in linearized PDFs with incremental updates.

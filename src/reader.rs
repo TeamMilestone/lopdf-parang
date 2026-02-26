@@ -70,14 +70,7 @@ impl Document {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer)?;
 
-        Reader {
-            buffer: &buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password,
-        }
-        .read(filter_func)
+        Reader::new(&buffer, password).read(filter_func)
     }
 
     /// Load a PDF document from a memory slice.
@@ -85,16 +78,32 @@ impl Document {
         buffer.try_into()
     }
 
+    /// Load a PDF document from a memory slice with a filter function.
+    ///
+    /// The filter function is called for each object after parsing.
+    /// Return `Some((id, object))` to keep the object, or `None` to skip it.
+    pub fn load_mem_filtered(buffer: &[u8], filter_func: FilterFunc) -> Result<Document> {
+        Reader::new(buffer, None).read(Some(filter_func))
+    }
+
+    /// Load a PDF document from a memory slice, skipping stream content
+    /// for streams matching the given predicate.
+    ///
+    /// Streams whose dict matches the predicate will have empty content
+    /// (the parser still advances past the data). This avoids large
+    /// allocations for unwanted streams (e.g. images during text extraction).
+    pub fn load_mem_skip_streams(
+        buffer: &[u8],
+        skip_predicate: fn(&Dictionary) -> bool,
+    ) -> Result<Document> {
+        let mut reader = Reader::new(buffer, None);
+        reader.skip_stream_content = Some(skip_predicate);
+        reader.read(None)
+    }
+
     /// Load a PDF document from a memory slice with a password for encrypted PDFs.
     pub fn load_mem_with_password(buffer: &[u8], password: &str) -> Result<Document> {
-        Reader {
-            buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: Some(password.to_string()),
-        }
-        .read(None)
+        Reader::new(buffer, Some(password.to_string())).read(None)
     }
 
     /// Load PDF metadata (title and page count) without loading the entire document.
@@ -129,27 +138,13 @@ impl Document {
     /// Load PDF metadata from a memory slice without loading the entire document.
     #[inline]
     pub fn load_metadata_mem(buffer: &[u8]) -> Result<PdfMetadata> {
-        Reader {
-            buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: None,
-        }
-        .read_metadata()
+        Reader::new(buffer, None).read_metadata()
     }
 
     /// Load PDF metadata from a memory slice with a password for encrypted PDFs.
     #[inline]
     pub fn load_metadata_mem_with_password(buffer: &[u8], password: &str) -> Result<PdfMetadata> {
-        Reader {
-            buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: Some(password.to_string()),
-        }
-        .read_metadata()
+        Reader::new(buffer, Some(password.to_string())).read_metadata()
     }
 
     fn load_metadata_internal<R: Read>(
@@ -158,14 +153,7 @@ impl Document {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer)?;
 
-        Reader {
-            buffer: &buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password,
-        }
-        .read_metadata()
+        Reader::new(&buffer, password).read_metadata()
     }
 }
 
@@ -201,14 +189,7 @@ impl Document {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer).await?;
 
-        Reader {
-            buffer: &buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password,
-        }
-        .read(filter_func)
+        Reader::new(&buffer, password).read(filter_func)
     }
 
     /// Load a PDF document from a memory slice.
@@ -250,27 +231,13 @@ impl Document {
     /// Load PDF metadata from a memory slice without loading the entire document.
     #[inline]
     pub fn load_metadata_mem(buffer: &[u8]) -> Result<PdfMetadata> {
-        Reader {
-            buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: None,
-        }
-        .read_metadata()
+        Reader::new(buffer, None).read_metadata()
     }
 
     /// Load PDF metadata from a memory slice with a password for encrypted PDFs.
     #[inline]
     pub fn load_metadata_mem_with_password(buffer: &[u8], password: &str) -> Result<PdfMetadata> {
-        Reader {
-            buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: Some(password.to_string()),
-        }
-        .read_metadata()
+        Reader::new(buffer, Some(password.to_string())).read_metadata()
     }
 
     async fn load_metadata_internal<R: AsyncRead>(
@@ -281,14 +248,7 @@ impl Document {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer).await?;
 
-        Reader {
-            buffer: &buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password,
-        }
-        .read_metadata()
+        Reader::new(&buffer, password).read_metadata()
     }
 }
 
@@ -296,14 +256,7 @@ impl TryInto<Document> for &[u8] {
     type Error = Error;
 
     fn try_into(self) -> Result<Document> {
-        Reader {
-            buffer: self,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: None,
-        }
-        .read(None)
+        Reader::new(self, None).read(None)
     }
 }
 
@@ -327,14 +280,7 @@ impl IncrementalDocument {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer)?;
 
-        let document = Reader {
-            buffer: &buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: None,
-        }
-        .read(None)?;
+        let document = Reader::new(&buffer, None).read(None)?;
 
         Ok(IncrementalDocument::create_from(buffer, document))
     }
@@ -368,14 +314,7 @@ impl IncrementalDocument {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer).await?;
 
-        let document = Reader {
-            buffer: &buffer,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: None,
-        }
-        .read(None)?;
+        let document = Reader::new(&buffer, None).read(None)?;
 
         Ok(IncrementalDocument::create_from(buffer, document))
     }
@@ -390,15 +329,7 @@ impl TryInto<IncrementalDocument> for &[u8] {
     type Error = Error;
 
     fn try_into(self) -> Result<IncrementalDocument> {
-        let document = Reader {
-            buffer: self,
-            document: Document::new(),
-            encryption_state: None,
-            raw_objects: BTreeMap::new(),
-            password: None,
-        }
-        .read(None)?;
-
+        let document = Reader::new(self, None).read(None)?;
         Ok(IncrementalDocument::create_from(self.to_vec(), document))
     }
 }
@@ -409,6 +340,25 @@ pub struct Reader<'a> {
     pub encryption_state: Option<EncryptionState>,
     pub raw_objects: BTreeMap<ObjectId, Vec<u8>>, // Store raw bytes for encrypted objects
     pub password: Option<String>,                 // Password for encrypted PDFs
+    /// Optional predicate to skip stream content during parsing.
+    /// If set and returns true for a stream dict, the stream content bytes
+    /// will not be copied (empty vec used instead). The parser still advances
+    /// past the stream data. This avoids allocating large buffers for
+    /// unwanted streams (e.g. images during text extraction).
+    pub skip_stream_content: Option<fn(&Dictionary) -> bool>,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buffer: &'a [u8], password: Option<String>) -> Self {
+        Reader {
+            buffer,
+            document: Document::new(),
+            encryption_state: None,
+            raw_objects: BTreeMap::new(),
+            password,
+            skip_stream_content: None,
+        }
+    }
 }
 
 /// Maximum allowed embedding of literal strings.
