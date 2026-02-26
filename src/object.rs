@@ -30,6 +30,9 @@ pub struct Stream {
     pub allows_compression: bool,
     /// Stream data's position in PDF file.
     pub start_position: Option<usize>,
+    /// Raw (compressed) length of the stream data in the backing buffer.
+    /// Set when content is skipped (empty) for lazy loading from backing buffer.
+    pub raw_length: Option<usize>,
 }
 
 /// Basic PDF object types defined in an enum.
@@ -605,6 +608,18 @@ impl Stream {
             content,
             allows_compression: true,
             start_position: None,
+            raw_length: None,
+        }
+    }
+
+    /// Create a stream with empty content and a raw_length hint for lazy loading.
+    pub fn new_lazy(dict: Dictionary, start_position: usize, raw_length: usize) -> Stream {
+        Stream {
+            dict,
+            content: vec![],
+            allows_compression: true,
+            start_position: Some(start_position),
+            raw_length: Some(raw_length),
         }
     }
 
@@ -614,6 +629,7 @@ impl Stream {
             content: vec![],
             allows_compression: true,
             start_position: Some(position),
+            raw_length: None,
         }
     }
 
@@ -677,10 +693,26 @@ impl Stream {
     }
 
     pub fn decompressed_content(&self) -> Result<Vec<u8>> {
-        let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
-        let filters = self.filters()?;
+        self.decompressed_content_from(&self.content)
+    }
 
-        let mut input = self.content.as_slice();
+    /// Decompress/decode stream content from an external raw byte slice.
+    /// Used for lazy loading when content was not stored during parse.
+    pub fn decompressed_content_from(&self, raw: &[u8]) -> Result<Vec<u8>> {
+        let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
+        let filters = self.filters();
+
+        // No filter → return raw bytes as-is
+        let filters = match filters {
+            Ok(f) => f,
+            Err(_) => return Ok(raw.to_vec()),
+        };
+
+        if filters.is_empty() {
+            return Ok(raw.to_vec());
+        }
+
+        let mut input = raw;
         let mut output = vec![];
 
         // Filters are in decoding order.
@@ -732,7 +764,8 @@ impl Stream {
         use flate2::read::ZlibDecoder;
         use std::io::prelude::*;
 
-        let mut output = Vec::with_capacity(input.len() * 2);
+        // PDF content streams compress at ~4-10:1; start with 6x to minimize Vec growths.
+        let mut output = Vec::with_capacity(input.len() * 6);
         let mut decoder = ZlibDecoder::new(input);
 
         if !input.is_empty() {

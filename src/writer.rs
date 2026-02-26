@@ -239,6 +239,7 @@ impl Document {
             allows_compression: true,
             content: stream,
             start_position: None,
+            raw_length: None,
         });
         // Insert Cross Reference Stream as an `Object` to the end of the PDF.
         // The `Object` is not added to `Document` because it is generated every time you save.

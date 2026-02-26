@@ -1,7 +1,57 @@
 use log::{error, warn};
 use std::cmp;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap as AHashMap, HashSet};
 use std::convert::TryInto;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+
+/// Sub-phase profiling counters for lopdf (nanoseconds, activated by LOPDF_PROFILE=1).
+pub static PROF_XREF: AtomicU64 = AtomicU64::new(0);
+pub static PROF_PARALLEL_PARSE: AtomicU64 = AtomicU64::new(0);
+pub static PROF_OBJ_STREAMS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_ZERO_LEN: AtomicU64 = AtomicU64::new(0);
+pub static PROF_GET_PAGES: AtomicU64 = AtomicU64::new(0);
+/// ObjStm sub-phases (within parallel_parse): decompression vs sub-object parsing.
+pub static PROF_OBJSTM_DECOMP: AtomicU64 = AtomicU64::new(0);
+pub static PROF_OBJSTM_PARSE: AtomicU64 = AtomicU64::new(0);
+pub static PROF_OBJSTM_COUNT: AtomicU64 = AtomicU64::new(0);
+/// read_object() time (nom parser for all Normal xref entries).
+pub static PROF_READ_OBJ: AtomicU64 = AtomicU64::new(0);
+/// ObjStm block time (after read_object, for ObjStm entries only).
+pub static PROF_OBJSTM_BLOCK: AtomicU64 = AtomicU64::new(0);
+/// Total Normal xref entries processed.
+pub static PROF_NORMAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Print lopdf sub-phase summary and reset counters.
+pub fn print_lopdf_profile() {
+    let xref = PROF_XREF.swap(0, AtomicOrd::Relaxed);
+    let par = PROF_PARALLEL_PARSE.swap(0, AtomicOrd::Relaxed);
+    let obj_st = PROF_OBJ_STREAMS.swap(0, AtomicOrd::Relaxed);
+    let zero = PROF_ZERO_LEN.swap(0, AtomicOrd::Relaxed);
+    let pages = PROF_GET_PAGES.swap(0, AtomicOrd::Relaxed);
+    let decomp = PROF_OBJSTM_DECOMP.swap(0, AtomicOrd::Relaxed);
+    let parse = PROF_OBJSTM_PARSE.swap(0, AtomicOrd::Relaxed);
+    let count = PROF_OBJSTM_COUNT.swap(0, AtomicOrd::Relaxed);
+    let read_obj = PROF_READ_OBJ.swap(0, AtomicOrd::Relaxed);
+    let objstm_block = PROF_OBJSTM_BLOCK.swap(0, AtomicOrd::Relaxed);
+    let normal_count = PROF_NORMAL_COUNT.swap(0, AtomicOrd::Relaxed);
+    let total = xref + par + obj_st + zero + pages;
+    if total == 0 { return; }
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let pct = |ns: u64| ns as f64 / total as f64 * 100.0;
+    eprintln!("=== LOPDF PROFILE ===");
+    eprintln!("  xref_parse:      {:>10.1}ms  ({:>5.1}%)", ms(xref), pct(xref));
+    eprintln!("  parallel_parse:  {:>10.1}ms  ({:>5.1}%)", ms(par), pct(par));
+    eprintln!("    read_object:   {:>10.1}ms  (Normal xref count: {})", ms(read_obj), normal_count);
+    if count > 0 {
+        eprintln!("    objstm_block:  {:>10.1}ms  (ObjStm total incl. data.to_vec)", ms(objstm_block));
+        eprintln!("    objstm_decomp: {:>10.1}ms  (ObjStm count: {})", ms(decomp), count);
+        eprintln!("    objstm_parse:  {:>10.1}ms", ms(parse));
+    }
+    eprintln!("  obj_streams:     {:>10.1}ms  ({:>5.1}%)", ms(obj_st), pct(obj_st));
+    eprintln!("  zero_len:        {:>10.1}ms  ({:>5.1}%)", ms(zero), pct(zero));
+    eprintln!("  get_pages:       {:>10.1}ms  ({:>5.1}%)", ms(pages), pct(pages));
+    eprintln!("  TOTAL:           {:>10.1}ms", ms(total));
+}
 #[cfg(not(feature = "async"))]
 use std::fs::File;
 #[cfg(not(feature = "async"))]
@@ -99,6 +149,24 @@ impl Document {
         let mut reader = Reader::new(buffer, None);
         reader.skip_stream_content = Some(skip_predicate);
         reader.read(None)
+    }
+
+    /// Load a PDF document from an Arc<Vec<u8>>, skipping stream content for streams
+    /// matching the given predicate, and storing the Arc in the document as a backing
+    /// buffer for lazy stream reading.
+    ///
+    /// This is the preferred method for text extraction workloads: combined with a
+    /// skip_predicate that skips most streams, it avoids large content allocations
+    /// during parse and instead reads stream bytes on demand from the backing buffer.
+    pub fn load_from_arc(
+        buffer: std::sync::Arc<Vec<u8>>,
+        skip_predicate: fn(&Dictionary) -> bool,
+    ) -> Result<Document> {
+        let mut reader = Reader::new(&buffer, None);
+        reader.skip_stream_content = Some(skip_predicate);
+        let mut doc = reader.read(None)?;
+        doc.backing_buffer = Some(buffer);
+        Ok(doc)
     }
 
     /// Load a PDF document from a memory slice with a password for encrypted PDFs.
@@ -674,6 +742,9 @@ impl Reader<'_> {
             }
         }
 
+        let profiling = std::env::var_os("LOPDF_PROFILE").is_some();
+        let t_xref = std::time::Instant::now();
+
         let xref_start = Self::get_xref_start(self.buffer)?;
         if xref_start > self.buffer.len() {
             return Err(Error::Xref(XrefError::Start));
@@ -722,6 +793,10 @@ impl Reader<'_> {
             xref.size = xref_entry_count;
         }
 
+        if profiling {
+            PROF_XREF.fetch_add(t_xref.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+        }
+
         self.document.version = version;
         self.document.max_id = xref.size - 1;
         self.document.trailer = trailer;
@@ -735,7 +810,7 @@ impl Reader<'_> {
             self.load_encrypted_document(filter_func)?;
         } else {
             // For non-encrypted PDFs, use the normal loading
-            self.load_objects_raw(filter_func)?;
+            self.load_objects_raw(filter_func, profiling)?;
         }
 
         Ok(self.document)
@@ -797,8 +872,7 @@ impl Reader<'_> {
                 }
             }
 
-            let mut streams_to_process: std::collections::HashMap<u32, Vec<(u32, u16)>> =
-                std::collections::HashMap::new();
+            let mut streams_to_process: AHashMap<u32, Vec<(u32, u16)>> = AHashMap::new();
             for (obj_num, container_id, index) in object_streams {
                 streams_to_process
                     .entry(container_id)
@@ -846,7 +920,7 @@ impl Reader<'_> {
         )
     }
 
-    fn load_objects_raw(&mut self, filter_func: Option<FilterFunc>) -> Result<()> {
+    fn load_objects_raw(&mut self, filter_func: Option<FilterFunc>, profiling: bool) -> Result<()> {
         let is_encrypted = self.document.trailer.get(b"Encrypt").is_ok();
         let zero_length_streams = Mutex::new(vec![]);
         let object_streams = Mutex::new(vec![]);
@@ -854,7 +928,12 @@ impl Reader<'_> {
         let entries_filter_map = |(_, entry): (&_, &_)| {
             if let XrefEntry::Normal { offset, .. } = *entry {
                 // read_object now handles decryption internally
+                let t_ro = if profiling { Some(std::time::Instant::now()) } else { None };
                 let result = self.read_object(offset as usize, None, &mut HashSet::new());
+                if let Some(t) = t_ro {
+                    PROF_READ_OBJ.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+                    PROF_NORMAL_COUNT.fetch_add(1, AtomicOrd::Relaxed);
+                }
                 let (object_id, mut object) = match result {
                     Ok(obj) => obj,
                     Err(e) => {
@@ -874,6 +953,7 @@ impl Reader<'_> {
 
                 if let Ok(ref mut stream) = object.as_stream_mut() {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
+                        let t_ob = if profiling { Some(std::time::Instant::now()) } else { None };
                         let obj_stream = ObjectStream::new(stream).ok()?;
                         let mut object_streams = object_streams.lock().unwrap();
                         // TODO: Is insert and replace intended behavior?
@@ -888,7 +968,13 @@ impl Reader<'_> {
                         } else {
                             object_streams.extend(obj_stream.objects);
                         }
-                    } else if stream.content.is_empty() {
+                        if let Some(t) = t_ob {
+                            PROF_OBJSTM_BLOCK.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+                        }
+                    } else if stream.content.is_empty() && stream.raw_length.is_none() {
+                        // Only re-read genuinely zero-length streams.
+                        // Lazy streams (raw_length.is_some()) have intentionally empty content
+                        // and should not be re-read here — that would undo the lazy loading.
                         let mut zero_length_streams = zero_length_streams.lock().unwrap();
                         zero_length_streams.push(object_id);
                     }
@@ -899,6 +985,8 @@ impl Reader<'_> {
                 None
             }
         };
+
+        let t_par = std::time::Instant::now();
 
         #[cfg(feature = "rayon")]
         {
@@ -921,13 +1009,25 @@ impl Reader<'_> {
                 .collect();
         }
 
+        if profiling {
+            PROF_PARALLEL_PARSE.fetch_add(t_par.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+        }
+
         // Only add entries, but never replace entries
+        let t_obj = std::time::Instant::now();
         for (id, entry) in object_streams.into_inner().unwrap() {
             self.document.objects.entry(id).or_insert(entry);
         }
+        if profiling {
+            PROF_OBJ_STREAMS.fetch_add(t_obj.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+        }
 
+        let t_zero = std::time::Instant::now();
         for object_id in zero_length_streams.into_inner().unwrap() {
             let _ = self.read_stream_content(object_id);
+        }
+        if profiling {
+            PROF_ZERO_LEN.fetch_add(t_zero.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
         }
 
         Ok(())
@@ -1159,14 +1259,31 @@ impl Reader<'_> {
             return Err(Error::InvalidOffset(offset));
         }
 
-        // Just parse without decryption - we'll decrypt later
-        parser::indirect_object(
-            ParserInput::new_extra(self.buffer, "indirect object"),
-            offset,
+        // OPTIMIZATION: Slice the buffer at `offset` first, then call indirect_object
+        // with offset=0. This avoids LocatedSpan::take_from(offset) which must scan all
+        // `offset` bytes for newline counting — an O(file_offset) operation per object.
+        // With take_from(0), consumed_len=0 → slice_by returns immediately without scan.
+        let sliced = &self.buffer[offset..];
+        let (object_id, mut object) = parser::indirect_object(
+            ParserInput::new_extra(sliced, "indirect object"),
+            0, // take_from(0) is O(1)
             expected_id,
             self,
             already_seen,
         )
+        .map_err(|e| match e {
+            // Remap IndirectObject error to use real file offset (not 0) for diagnostics
+            Error::IndirectObject { offset: _ } => Error::IndirectObject { offset },
+            other => other,
+        })?;
+
+        // Adjust stream start_position from slice-relative to file-absolute.
+        // (indirect_object with offset=0 adds 0; we add the real offset here.)
+        if let Object::Stream(ref mut stream) = object {
+            stream.start_position = stream.start_position.and_then(|sp| sp.checked_add(offset));
+        }
+
+        Ok((object_id, object))
     }
 
     fn get_xref_start(buffer: &[u8]) -> Result<usize> {

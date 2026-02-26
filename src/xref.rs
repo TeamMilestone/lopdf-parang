@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::{Result, Write};
 
 #[derive(Debug, Clone)]
@@ -9,7 +9,7 @@ pub struct Xref {
     pub cross_reference_type: XrefType,
 
     /// Entries for indirect object.
-    pub entries: BTreeMap<u32, XrefEntry>,
+    pub entries: HashMap<u32, XrefEntry>,
 
     /// Total number of entries (including free entries), equal to the highest object number plus 1.
     pub size: u32,
@@ -41,7 +41,7 @@ impl Xref {
     pub fn new(size: u32, xref_type: XrefType) -> Xref {
         Xref {
             cross_reference_type: xref_type,
-            entries: BTreeMap::new(),
+            entries: HashMap::new(),
             size,
         }
     }

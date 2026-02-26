@@ -323,13 +323,22 @@ fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
             return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
         }
         // Try to read stream data using the declared Length value
-        if let Ok((i, data)) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
+        if let Ok((i_after_stream, data)) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
             // If reader has a skip predicate and the dict matches, skip the content copy
             let should_skip = reader.skip_stream_content
                 .map(|pred| pred(&dict))
                 .unwrap_or(false);
-            let content = if should_skip { vec![] } else { data.to_vec() };
-            return Ok((i, Object::Stream(Stream::new(dict, content))));
+            if should_skip {
+                // Store position+length for lazy reading from backing buffer.
+                // start_position is the position of stream content within this function's input.
+                // offset_stream() will add further offsets to make it absolute.
+                let content_start = input.len() - i.len();
+                let raw_len = data.len();
+                let stream = Stream::new_lazy(dict, content_start, raw_len);
+                return Ok((i_after_stream, Object::Stream(stream)));
+            }
+            let content = data.to_vec();
+            return Ok((i_after_stream, Object::Stream(Stream::new(dict, content))));
         }
         // Fallback: Only for xref streams (/Type /XRef) where Length is often
         // incorrect in linearized PDFs with incremental updates.

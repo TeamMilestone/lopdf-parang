@@ -46,7 +46,7 @@ pub use error::{Error, Result};
 pub use incremental_document::IncrementalDocument;
 pub use object_stream::{ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
-pub use reader::{Reader, PdfMetadata};
+pub use reader::{Reader, PdfMetadata, print_lopdf_profile, PROF_XREF, PROF_PARALLEL_PARSE, PROF_OBJ_STREAMS, PROF_ZERO_LEN, PROF_GET_PAGES, PROF_OBJSTM_DECOMP, PROF_OBJSTM_PARSE, PROF_OBJSTM_COUNT, PROF_READ_OBJ, PROF_OBJSTM_BLOCK, PROF_NORMAL_COUNT};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
 pub use toc::Toc;
 

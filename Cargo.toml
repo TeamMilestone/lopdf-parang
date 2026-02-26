@@ -26,7 +26,7 @@ chrono = { version = "0.4", optional = true, default-features = false, features 
 ] }
 ecb = "0.1.2"
 encoding_rs = "0.8.32"
-flate2 = "1.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 image = { version = "0.25", optional = true }
 indexmap = "2.2.3"
 itoa = "1.0"

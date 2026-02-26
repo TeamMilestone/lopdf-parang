@@ -1,8 +1,10 @@
 use crate::parser::{self, ParserInput};
 use crate::{Document, Error, Object, ObjectId, Result, Stream};
+use crate::{PROF_OBJSTM_DECOMP, PROF_OBJSTM_PARSE, PROF_OBJSTM_COUNT};
 use std::collections::BTreeMap;
 use std::num::TryFromIntError;
 use std::str::FromStr;
+use std::sync::atomic::Ordering as AtomicOrd;
 
 use log::warn;
 #[cfg(feature = "rayon")]
@@ -39,7 +41,13 @@ impl Default for ObjectStreamConfig {
 impl ObjectStream {
     /// Parse an existing object stream
     pub fn new(stream: &mut Stream) -> Result<ObjectStream> {
+        let profiling = std::env::var_os("LOPDF_PROFILE").is_some();
+        let t_decomp = std::time::Instant::now();
         let _ = stream.decompress();
+        if profiling {
+            PROF_OBJSTM_DECOMP.fetch_add(t_decomp.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+            PROF_OBJSTM_COUNT.fetch_add(1, AtomicOrd::Relaxed);
+        }
 
         if stream.content.is_empty() {
             return Ok(ObjectStream {
@@ -84,12 +92,16 @@ impl ObjectStream {
 
             Some(((id, 0), object))
         };
+        let t_parse = std::time::Instant::now();
         #[cfg(feature = "rayon")]
         let objects = numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect();
         #[cfg(not(feature = "rayon"))]
         let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
+        if profiling {
+            PROF_OBJSTM_PARSE.fetch_add(t_parse.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+        }
 
-        Ok(ObjectStream { 
+        Ok(ObjectStream {
             objects,
             max_objects: 100,
             compression_level: 6,

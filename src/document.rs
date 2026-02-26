@@ -32,7 +32,7 @@ pub struct Document {
     pub reference_table: Xref,
 
     /// The objects that make up the document contained in the file.
-    pub objects: BTreeMap<ObjectId, Object>,
+    pub objects: HashMap<ObjectId, Object>,
 
     /// Current maximum object id within the document.
     pub max_id: u32,
@@ -56,6 +56,11 @@ pub struct Document {
     /// The encryption state stores the parameters that were used to decrypt this document if the
     /// document has been decrypted.
     pub encryption_state: Option<EncryptionState>,
+
+    /// Backing buffer for lazy stream reading.
+    /// When set, streams with empty content can be read on demand from this buffer
+    /// using their start_position and raw_length fields.
+    pub backing_buffer: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Document {
@@ -66,13 +71,14 @@ impl Document {
             binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
             trailer: Dictionary::new(),
             reference_table: Xref::new(0, XrefType::CrossReferenceStream),
-            objects: BTreeMap::new(),
+            objects: HashMap::new(),
             max_id: 0,
             max_bookmark_id: 0,
             bookmarks: Vec::new(),
             bookmark_table: HashMap::new(),
             xref_start: 0,
             encryption_state: None,
+            backing_buffer: None,
         }
     }
 
@@ -85,14 +91,24 @@ impl Document {
             binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
             trailer: new_trailer,
             reference_table: Xref::new(0, prev.reference_table.cross_reference_type),
-            objects: BTreeMap::new(),
+            objects: HashMap::new(),
             max_id: prev.max_id,
             max_bookmark_id: prev.max_bookmark_id,
             bookmarks: Vec::new(),
             bookmark_table: HashMap::new(),
             xref_start: 0,
             encryption_state: None,
+            backing_buffer: None,
         }
+    }
+
+    /// Get the raw (compressed) bytes of a stream from the backing buffer.
+    /// Returns None if no backing buffer is set or the stream has no position/length info.
+    pub fn get_stream_backing_bytes<'a>(&'a self, stream: &Stream) -> Option<&'a [u8]> {
+        let buf = self.backing_buffer.as_ref()?;
+        let start = stream.start_position?;
+        let len = stream.raw_length?;
+        buf.get(start..start + len)
     }
 
     const DEREF_LIMIT: usize = 128;
