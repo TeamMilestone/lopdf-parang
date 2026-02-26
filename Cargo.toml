@@ -1,19 +1,20 @@
 [package]
 authors = [
+    "Wonsup Lee <onesup.lee@gmail.com>",
     "Junfeng Liu <china.liujunfeng@gmail.com>",
     "Emulator <emulator@hotmail.it>",
 ]
 categories = ["text-processing"]
-description = "A Rust library for PDF document manipulation."
-documentation = "https://docs.rs/crate/lopdf/"
+description = "A fork of lopdf optimized for PDF text extraction — lazy streams, O(1) object slicing, zlib-rs."
+documentation = "https://docs.rs/crate/lopdf-parang/"
 edition = "2024"
-homepage = "https://github.com/J-F-Liu/lopdf"
-keywords = ["pdf", "editing", "manipulation", "merge"]
+homepage = "https://github.com/TeamMilestone/lopdf-parang"
+keywords = ["pdf", "text-extraction", "parsing"]
 license = "MIT"
-name = "lopdf"
+name = "lopdf-parang"
 readme = "README.md"
-repository = "https://github.com/J-F-Liu/lopdf.git"
-version = "0.39.0"
+repository = "https://github.com/TeamMilestone/lopdf-parang.git"
+version = "0.39.1"
 rust-version = "1.85"
 
 [dependencies]
